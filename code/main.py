@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Инструмент визуализации графа зависимостей пакетов
-Этап 2: Сбор данных
+Этап 3: Основные операции
 """
 
 import argparse
@@ -10,10 +10,15 @@ import os
 import json
 import urllib.request
 import urllib.error
+from collections import deque, defaultdict
 
 class DependencyVisualizer:
     def __init__(self):
         self.config = {}
+        self.dependency_graph = defaultdict(dict)
+        self.visited = set()
+        self.recursion_stack = set()
+        self.cycle_detected = False
         
     def parse_arguments(self):
         """Парсинг аргументов командной строки"""
@@ -77,25 +82,19 @@ class DependencyVisualizer:
         
         return errors
     
-    def get_package_info_from_url(self, package_name, url):
+    def get_package_info_from_url(self, package_name):
         """Получение информации о пакете из npm реестра"""
         try:
-            # Формируем URL для npm реестра
             npm_registry_url = f"https://registry.npmjs.org/{package_name}"
-            
-            print(f"Запрос информации о пакете: {npm_registry_url}")
             
             with urllib.request.urlopen(npm_registry_url) as response:
                 data = json.loads(response.read().decode())
-                
-            # Получаем последнюю версию
+            
             if 'dist-tags' in data and 'latest' in data['dist-tags']:
                 latest_version = data['dist-tags']['latest']
             else:
-                # Берем первую доступную версию
                 latest_version = list(data.get('versions', {}).keys())[0]
             
-            # Получаем зависимости для последней версии
             version_data = data['versions'][latest_version]
             dependencies = version_data.get('dependencies', {})
             
@@ -110,67 +109,150 @@ class DependencyVisualizer:
                 raise Exception(f"Пакет '{package_name}' не найден в npm реестре")
             else:
                 raise Exception(f"Ошибка HTTP при запросе пакета: {e}")
-        except urllib.error.URLError as e:
-            raise Exception(f"Ошибка сети: {e}")
-        except json.JSONDecodeError as e:
-            raise Exception(f"Ошибка парсинга JSON: {e}")
         except Exception as e:
-            raise Exception(f"Неизвестная ошибка при получении информации о пакете: {e}")
+            raise Exception(f"Ошибка при получении информации о пакете '{package_name}': {e}")
     
     def get_package_info_from_file(self, package_name, file_path):
-        """Получение информации о пакете из файла (для тестового режима)"""
+        """Получение информации о пакете из тестового файла"""
         try:
             with open(file_path, 'r') as f:
                 data = json.load(f)
             
-            if package_name not in data:
+            # Поддержка формата с пакетами в виде больших латинских букв
+            if package_name in data:
+                package_info = data[package_name]
+            else:
+                # Попробовать найти пакет в другом формате
                 raise Exception(f"Пакет '{package_name}' не найден в тестовом файле")
             
-            package_info = data[package_name]
             return {
                 'name': package_name,
                 'version': package_info.get('version', '1.0.0'),
                 'dependencies': package_info.get('dependencies', {})
             }
             
-        except FileNotFoundError:
-            raise Exception(f"Тестовый файл не найден: {file_path}")
-        except json.JSONDecodeError:
-            raise Exception(f"Ошибка парсинга JSON в файле: {file_path}")
         except Exception as e:
             raise Exception(f"Ошибка при чтении тестового файла: {e}")
     
-    def get_direct_dependencies(self, args):
-        """Получение прямых зависимостей пакета"""
-        if args.test_mode:
-            package_info = self.get_package_info_from_file(args.package, args.source)
-        else:
-            package_info = self.get_package_info_from_url(args.package, args.source)
-        
-        return package_info['dependencies']
-    
-    def print_direct_dependencies(self, dependencies):
-        """Вывод прямых зависимостей на экран"""
-        if not dependencies:
-            print("Прямые зависимости не найдены")
+    def build_dependency_graph_bfs(self, start_package, args, depth=0, max_depth=10):
+        """Построение графа зависимостей с помощью BFS с рекурсией"""
+        if depth > max_depth:
+            print(f"Предупреждение: достигнута максимальная глубина {max_depth} для пакета {start_package}")
             return
         
-        print(f"\nПрямые зависимости пакета:")
-        print("-" * 30)
-        for dep_name, dep_version in dependencies.items():
-            print(f"  {dep_name}: {dep_version}")
-        print("-" * 30)
+        if start_package in self.recursion_stack:
+            print(f"Обнаружена циклическая зависимость: {start_package}")
+            self.cycle_detected = True
+            return
+        
+        if start_package in self.visited:
+            return
+        
+        self.visited.add(start_package)
+        self.recursion_stack.add(start_package)
+        
+        try:
+            # Получение информации о пакете
+            if args.test_mode:
+                package_info = self.get_package_info_from_file(start_package, args.source)
+            else:
+                package_info = self.get_package_info_from_url(start_package)
+            
+            dependencies = package_info.get('dependencies', {})
+            
+            # Сохраняем зависимости в графе
+            self.dependency_graph[start_package] = dependencies
+            
+            # Рекурсивно обрабатываем зависимости
+            for dep_name in dependencies.keys():
+                self.build_dependency_graph_bfs(dep_name, args, depth + 1, max_depth)
+                
+        except Exception as e:
+            print(f"Ошибка при обработке пакета {start_package}: {e}")
+        finally:
+            self.recursion_stack.remove(start_package)
     
-    def print_configuration(self, args):
-        """Вывод конфигурации в формате ключ-значение"""
-        print("Конфигурация приложения:")
-        print("=" * 40)
-        print(f"Имя анализируемого пакета: {args.package}")
-        print(f"Источник данных: {args.source}")
-        print(f"Режим тестирования: {'Включен' if args.test_mode else 'Выключен'}")
-        print(f"Выходной файл: {args.output}")
-        print(f"Режим ASCII-дерева: {'Включен' if args.ascii_tree else 'Выключен'}")
-        print("=" * 40)
+    def print_ascii_tree(self, package, graph, prefix="", is_last=True):
+        """Вывод графа в формате ASCII-дерева"""
+        connectors = "└── " if is_last else "├── "
+        print(prefix + connectors + package)
+        
+        dependencies = list(graph.get(package, {}).keys())
+        new_prefix = prefix + ("    " if is_last else "│   ")
+        
+        for i, dep in enumerate(dependencies):
+            is_last_dep = i == len(dependencies) - 1
+            if dep in graph:
+                self.print_ascii_tree(dep, graph, new_prefix, is_last_dep)
+            else:
+                connector = "└── " if is_last_dep else "├── "
+                print(new_prefix + connector + dep + " (не раскрыто)")
+    
+    def print_graph_info(self):
+        """Вывод информации о построенном графе"""
+        print(f"\nИнформация о графе зависимостей:")
+        print("-" * 40)
+        print(f"Всего пакетов: {len(self.dependency_graph)}")
+        print(f"Обнаружены циклические зависимости: {'Да' if self.cycle_detected else 'Нет'}")
+        
+        total_dependencies = sum(len(deps) for deps in self.dependency_graph.values())
+        print(f"Всего зависимостей: {total_dependencies}")
+        print("-" * 40)
+        
+        print("\nДетали графа:")
+        for package, dependencies in self.dependency_graph.items():
+            print(f"\n{package}:")
+            for dep, version in dependencies.items():
+                status = "✓" if dep in self.dependency_graph else "✗"
+                print(f"  {status} {dep}: {version}")
+    
+    def demonstrate_test_cases(self):
+        """Демонстрация различных случаев работы с тестовым репозиторием"""
+        test_cases = [
+            {
+                "name": "Простая цепочка зависимостей",
+                "file": "test_simple.json",
+                "package": "A"
+            },
+            {
+                "name": "Циклические зависимости", 
+                "file": "test_cycle.json",
+                "package": "A"
+            },
+            {
+                "name": "Множественные зависимости",
+                "file": "test_complex.json", 
+                "package": "A"
+            }
+        ]
+        
+        print("\nДемонстрация работы с тестовыми случаями:")
+        print("=" * 50)
+        
+        for test_case in test_cases:
+            print(f"\nТестовый случай: {test_case['name']}")
+            print(f"Файл: {test_case['file']}, Пакет: {test_case['package']}")
+            
+            if os.path.exists(test_case['file']):
+                # Сбрасываем состояние для нового теста
+                self.dependency_graph.clear()
+                self.visited.clear()
+                self.recursion_stack.clear()
+                self.cycle_detected = False
+                
+                try:
+                    self.build_dependency_graph_bfs(
+                        test_case['package'], 
+                        argparse.Namespace(
+                            test_mode=True,
+                            source=test_case['file']
+                        )
+                    )
+                    self.print_graph_info()
+                except Exception as e:
+                    print(f"Ошибка: {e}")
+            else:
+                print(f"Файл {test_case['file']} не найден")
     
     def run(self):
         """Основной метод запуска приложения"""
@@ -186,14 +268,33 @@ class DependencyVisualizer:
                     print(f"  - {error}")
                 sys.exit(1)
             
-            # Вывод конфигурации
-            self.print_configuration(args)
+            print("Конфигурация приложения:")
+            print("=" * 40)
+            print(f"Имя анализируемого пакета: {args.package}")
+            print(f"Источник данных: {args.source}")
+            print(f"Режим тестирования: {'Включен' if args.test_mode else 'Выключен'}")
+            print(f"Выходной файл: {args.output}")
+            print(f"Режим ASCII-дерева: {'Включен' if args.ascii_tree else 'Выключен'}")
+            print("=" * 40)
             
-            # Получение и вывод прямых зависимостей
-            dependencies = self.get_direct_dependencies(args)
-            self.print_direct_dependencies(dependencies)
+            # Построение графа зависимостей
+            print(f"\nПостроение графа зависимостей для пакета '{args.package}'...")
+            self.build_dependency_graph_bfs(args.package, args)
             
-            print("\nЭтап 2 завершен успешно!")
+            # Вывод результатов
+            self.print_graph_info()
+            
+            # Вывод ASCII-дерева если запрошено
+            if args.ascii_tree:
+                print(f"\nASCII-дерево зависимостей для '{args.package}':")
+                print("=" * 50)
+                self.print_ascii_tree(args.package, self.dependency_graph)
+            
+            # Демонстрация тестовых случаев если в тестовом режиме
+            if args.test_mode:
+                self.demonstrate_test_cases()
+            
+            print("\nЭтап 3 завершен успешно!")
             
         except Exception as e:
             print(f"Ошибка: {e}")
